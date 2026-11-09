@@ -26,6 +26,8 @@ Claude Code · ChatGPT · cualquier agente con terminal
 
 ---
 
+📖 **La historia de cómo se hizo y cómo funciona, en palabras simples (en inglés):** [STORY.md](STORY.md) · [blog post](https://diegoferreyra.com/writing/a-backup-skill-your-ai-agent-installs)
+
 ## ✨ Qué hace
 
 | | |
@@ -107,7 +109,7 @@ Si una carpeta respaldada tiene adentro otra que también tiene su propio `.dfd_
 
 ## 📋 Requisitos
 
-- macOS
+- macOS. **Por ahora solo funciona en Mac.** En Windows, tu agente probablemente pueda adaptarlo si mantiene los mismos principios: un programa que copia (rclone también funciona en Windows), una tarea programada (el *Programador de tareas* en vez de cron) y un archivo de ajustes por carpeta.
 - Un agente de IA que pueda ejecutar comandos en tu Mac: [Claude Code](https://claude.com/claude-code), ChatGPT/Codex u otro.
 - [rclone](https://rclone.org), el programa que copia los archivos (`brew install rclone`). El agente te ayuda a instalarlo y a conectarlo con tu Google Drive.
 
