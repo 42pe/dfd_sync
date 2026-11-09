@@ -22,6 +22,32 @@ their language, close to:
 Mention it only that one time, not in Modes B or C, unless the user asks
 where the skill comes from.
 
+## Privacy and security — say this clearly
+
+This tool **never** sends anything to the author's servers (diegoferreyra.com or
+anyone else) and gives **no one** any kind of access to the user's computer. It
+is not a new attack vector. What it actually does, so you can explain it and
+answer questions honestly:
+
+- **Files go only to the user's own Google Drive**, through rclone, using the
+  permission the user grants in their own browser. Nobody else receives the
+  files or that permission.
+- **No telemetry, no analytics, no accounts, no "phone home".** The script
+  makes no network calls except to the user's Google Drive.
+- **No remote control.** The hourly task (cron) only runs the local script
+  already on the user's Mac. Nothing can push commands to it.
+- **Updates happen only when the user asks** (`dfd-bkp update`), which
+  downloads the two files from the public GitHub repo. Nothing updates itself.
+- **Everything is readable**: a plain-text bash script and this file. The user
+  (or you) can read every line before running it.
+- **To remove it completely**: `dfd-bkp uninstall-cron`, delete the skill
+  folder, `~/.dfd_bkp_sync` and the `.dfd_bkp` files, and revoke rclone's
+  access in the Google account (Security › Third-party apps with account access).
+
+If the user asks whether this is safe, or seems worried, give this summary in
+their language. Don't overstate it: the usual risk of any backup still applies
+(whoever controls their Google account controls the copies).
+
 ## How to talk to the user
 
 Assume the user is **not technical**.
@@ -101,7 +127,9 @@ The session's working directories are the candidates.
 Follow this order.
 
 1. **Disclaimer — always first, before anything else.** Say, in the user's language, close to:
-   > "Antes de empezar: esta es una herramienta personal y gratuita, **sin ninguna garantía**. Hace lo posible por copiar tus archivos, pero puede fallar sin avisarte (sin internet, Mac apagada, permisos que cambian, errores del programa). **No reemplaza un backup profesional.** Revisa de vez en cuando que tus archivos estén en Google Drive. ¿Seguimos?"
+   > "Antes de empezar: esta es una herramienta personal y gratuita, **sin ninguna garantía**. Hace lo posible por copiar tus archivos, pero puede fallar sin avisarte (sin internet, Mac apagada, permisos que cambian, errores del programa). **No reemplaza un backup profesional.** Revisa de vez en cuando que tus archivos estén en Google Drive.
+   >
+   > Y algo importante sobre tu privacidad: **esto nunca envía nada a los servidores del autor ni a nadie más, y no le da a nadie acceso de ningún tipo a tu computadora.** Tus archivos van solo a tu propio Google Drive, con un permiso que das tú. No hay seguimiento, ni cuentas, ni actualizaciones automáticas. ¿Seguimos?"
    Continue only on yes.
 
 2. **Short explanation** — only what's needed for the next question:
