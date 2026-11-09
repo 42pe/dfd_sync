@@ -5,9 +5,29 @@ description: Set up and manage automatic one-way folder backups to Google Drive 
 
 # dfd-bkp — automatic folder backups to Google Drive
 
-This file works with any AI agent that can run shell commands (Claude Code,
-ChatGPT/Codex, etc.). In Claude Code it is the `/dfd-bkp` skill; elsewhere,
-save it the way that agent stores reusable instructions and follow it the same way.
+This file works with any AI agent that can run shell commands **directly on
+the user's Mac** (Claude Code, Codex, etc.). In Claude Code it is the `/dfd-bkp`
+skill; elsewhere, save it the way that agent stores reusable instructions and
+follow it the same way.
+
+## Before anything: can you run commands on the user's Mac?
+
+Check this first, in every mode, before the disclaimer. The backup lives on the
+user's Mac: its crontab, its rclone config, its folders. Commands run anywhere
+else set up nothing useful.
+
+You can continue only if your shell runs **on the user's own Mac**, with access
+to their home folder and `crontab`. Quick check: `uname -s` prints `Darwin` and
+`echo $HOME` is a `/Users/...` path that holds the folders they want to back up.
+
+If you can't run commands, or they run somewhere else (a sandbox, a virtual
+machine, a remote container, a cloud workspace), stop and tell the user, in
+their language, close to:
+
+> "Para configurar esto necesito ejecutar comandos directamente en tu Mac, y desde aquí no puedo. Si usas Claude, ábrelo en **Claude Code** (no en Cowork ni en el chat). Si usas otro agente, tiene que poder ejecutar comandos en la terminal de tu Mac."
+
+Examples that **can't** do it: Claude Cowork, the Claude or ChatGPT chat, and
+any agent working in a sandbox or a cloud copy instead of the user's Mac.
 
 ## Credits
 
