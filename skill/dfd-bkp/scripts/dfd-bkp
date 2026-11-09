@@ -1,0 +1,791 @@
+#!/bin/bash
+# dfd-bkp — one-way folder backups to Google Drive (or any rclone remote).
+#
+# Global config : ~/.dfd_bkp_sync   (FOLDER= lines + ARCHIVE_* defaults)
+# Folder config : <folder>/.dfd_bkp (DESTINATION, FREQUENCY, EXCLUDE, ...)
+# State         : ~/.local/state/dfd-bkp/
+# Logs          : ~/Library/Logs/dfd-bkp/
+#
+# Written for macOS bash 3.2 (no associative arrays, BSD date).
+
+set -u
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+VERSION="1.1.0"
+GLOBAL_CONFIG="${DFD_BKP_CONFIG:-$HOME/.dfd_bkp_sync}"
+STATE_DIR="${DFD_BKP_STATE:-$HOME/.local/state/dfd-bkp}"
+LOG_DIR="${DFD_BKP_LOGS:-$HOME/Library/Logs/dfd-bkp}"
+LOG_FILE="$LOG_DIR/dfd-bkp.log"
+CRON_MARKER="# dfd-bkp"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+# Built-in defaults. ~/.dfd_bkp_sync overrides the ARCHIVE_* ones,
+# and each .dfd_bkp overrides everything.
+D_REMOTE="gdrive"
+D_BASE="Backups"
+D_FREQUENCY="12h"
+D_ARCHIVE_RETENTION="90d"
+D_ARCHIVE_MAX_SIZE="1.00GB"
+D_ARCHIVE_OVERFLOW="keep_one"
+MIN_FREQUENCY=3600
+DUE_SLACK=300   # run up to 5 min early so hourly cron never skips a slot
+
+PRUNE_DIRS="node_modules .git vendor .Trash Library"
+
+# ---------------------------------------------------------------- helpers
+
+die()  { echo "dfd-bkp: $*" >&2; exit 1; }
+warn() { echo "dfd-bkp: warning: $*" >&2; }
+now()  { date +%s; }
+fmt_ts() { [ -n "${1:-}" ] && [ "$1" != "0" ] && date -r "$1" "+%Y-%m-%d %H:%M" || echo "never"; }
+
+log() {
+  mkdir -p "$LOG_DIR"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
+}
+
+expand_path() {
+  local p="$1"
+  case "$p" in
+    "~")   p="$HOME" ;;
+    "~/"*) p="$HOME/${p#\~/}" ;;
+  esac
+  # strip trailing slash (but keep "/")
+  [ "$p" != "/" ] && p="${p%/}"
+  echo "$p"
+}
+
+abs_dir() {
+  local d
+  d="$(expand_path "${1:-.}")"
+  [ -d "$d" ] || die "not a directory: $d"
+  (cd "$d" && pwd -P)
+}
+
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; echo "$s"; }
+
+# read_key FILE KEY -> last value of KEY in FILE (KEY=value, # comments)
+read_key() {
+  local file="$1" key="$2" line k v out=""
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(trim "$line")"
+    case "$line" in ""|\#*) continue ;; esac
+    k="$(trim "${line%%=*}")"
+    [ "$k" = "$key" ] || continue
+    v="$(trim "${line#*=}")"
+    out="$v"
+  done < "$file"
+  echo "$out"
+}
+
+# read_all FILE KEY -> every value of KEY, one per line
+read_all() {
+  local file="$1" key="$2" line k v
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(trim "$line")"
+    case "$line" in ""|\#*) continue ;; esac
+    k="$(trim "${line%%=*}")"
+    [ "$k" = "$key" ] || continue
+    v="$(trim "${line#*=}")"
+    [ -n "$v" ] && echo "$v"
+  done < "$file"
+}
+
+# setting DIR KEY DEFAULT -> folder value, else global value, else DEFAULT
+setting() {
+  local dir="$1" key="$2" def="$3" v
+  v="$(read_key "$dir/.dfd_bkp" "$key")"
+  [ -z "$v" ] && v="$(read_key "$GLOBAL_CONFIG" "$key")"
+  [ -z "$v" ] && v="$def"
+  echo "$v"
+}
+
+# set_key FILE KEY VALUE -> replace (or append) KEY=VALUE
+set_key() {
+  local file="$1" key="$2" value="$3" tmp
+  tmp="$(mktemp)"
+  if grep -qE "^[[:space:]]*$key[[:space:]]*=" "$file"; then
+    awk -v k="$key" -v v="$value" '
+      $0 ~ "^[[:space:]]*" k "[[:space:]]*=" { if (!done) { print k "=" v; done=1 }; next }
+      { print }' "$file" > "$tmp"
+  else
+    cat "$file" > "$tmp"; echo "$key=$value" >> "$tmp"
+  fi
+  cat "$tmp" > "$file"; rm -f "$tmp"
+}
+
+# "12h" / "2d" -> seconds (min 1h). Prints seconds; warns on clamp.
+parse_frequency() {
+  local f="$1" n unit s
+  case "$f" in
+    *[0-9]m) n="${f%m}"; unit=60 ;;
+    *[0-9]h) n="${f%h}"; unit=3600 ;;
+    *[0-9]d) n="${f%d}"; unit=86400 ;;
+    *) warn "invalid FREQUENCY '$f', using $D_FREQUENCY"; parse_frequency "$D_FREQUENCY"; return ;;
+  esac
+  case "$n" in ''|*[!0-9]*) warn "invalid FREQUENCY '$f', using $D_FREQUENCY"; parse_frequency "$D_FREQUENCY"; return ;; esac
+  s=$((n * unit))
+  if [ "$s" -lt "$MIN_FREQUENCY" ]; then
+    warn "FREQUENCY '$f' is below the 1h minimum, using 1h"
+    s=$MIN_FREQUENCY
+  fi
+  echo "$s"
+}
+
+# strict check for values written by init/set: Nh or Nd, at least 1h
+validate_frequency() {
+  echo "$1" | grep -qE '^[0-9]+[hd]$' || die "FREQUENCY must look like 12h or 2d (got '$1')"
+  local s; s="$(parse_frequency "$1" 2>/dev/null)"
+  [ "$s" -ge "$MIN_FREQUENCY" ] || die "FREQUENCY minimum is 1h (got '$1')"
+}
+
+# "90d" -> days ("0d" = keep no history)
+parse_days() {
+  local r="$1" n="${1%d}"
+  case "$r" in *d) ;; *) n="" ;; esac
+  case "$n" in ''|*[!0-9]*) warn "invalid ARCHIVE_RETENTION '$r', using $D_ARCHIVE_RETENTION"; n="${D_ARCHIVE_RETENTION%d}" ;; esac
+  echo "$n"
+}
+
+# "1.00GB" / "1.5GB" / "none" -> bytes ("none" = no limit -> prints 0)
+parse_size() {
+  local s="$1" n
+  case "$s" in ""|none|NONE|0) echo 0; return ;; esac
+  n="${s%GB}"; n="${n%gb}"
+  if ! echo "$n" | grep -qE '^[0-9]+(\.[0-9]{1,2})?$'; then
+    warn "invalid ARCHIVE_MAX_SIZE '$s' (use e.g. 1.00GB), using $D_ARCHIVE_MAX_SIZE"
+    n="${D_ARCHIVE_MAX_SIZE%GB}"
+  fi
+  awk -v n="$n" 'BEGIN { printf "%.0f\n", n * 1024 * 1024 * 1024 }'
+}
+
+human() { awk -v b="${1:-0}" 'BEGIN { u="B KB MB GB TB"; split(u,a," "); i=1; while (b>=1024 && i<5) { b/=1024; i++ }; printf (i==1?"%d %s":"%.2f %s"), b, a[i] }'; }
+
+state_key() { echo -n "$1" | md5 -q 2>/dev/null || echo -n "$1" | md5sum | cut -d' ' -f1; }
+last_file() { echo "$STATE_DIR/$(state_key "$1").last"; }
+status_file() { echo "$STATE_DIR/$(state_key "$1").status"; }
+get_last() { local f; f="$(last_file "$1")"; [ -f "$f" ] && cat "$f" || echo 0; }
+
+folder_name() { basename "$1"; }
+
+destination() { setting "$1" DESTINATION "$D_REMOTE:$D_BASE/$(folder_name "$1")"; }
+archive_destination() { setting "$1" ARCHIVE_DESTINATION "$D_REMOTE:$D_BASE/_archive/$(folder_name "$1")"; }
+
+is_enabled() {
+  local e; e="$(setting "$1" ENABLED true)"
+  case "$e" in true|yes|1|TRUE|True) return 0 ;; *) return 1 ;; esac
+}
+
+write_filter() {
+  local dir="$1" out="$2" p
+  : > "$out"
+  read_all "$dir/.dfd_bkp" EXCLUDE | while IFS= read -r p; do echo "- $p" >> "$out"; done
+}
+
+# ---------------------------------------------------------------- discovery
+
+parent_folders() {
+  local f
+  read_all "$GLOBAL_CONFIG" FOLDER | while IFS= read -r f; do expand_path "$f"; done
+}
+
+find_configs() {
+  local root prune_expr="" d
+  for d in $PRUNE_DIRS; do prune_expr="$prune_expr -name $d -o"; done
+  prune_expr="${prune_expr% -o}"
+  parent_folders | while IFS= read -r root; do
+    [ -d "$root" ] || { warn "parent folder not found: $root"; continue; }
+    # shellcheck disable=SC2086
+    find "$root" \( $prune_expr \) -prune -o -name .dfd_bkp -type f -print 2>/dev/null
+  done | while IFS= read -r f; do dirname "$f"; done | sort -u
+}
+
+covered_by_parent() {
+  local dir="$1" root
+  while IFS= read -r root; do
+    [ -d "$root" ] && root="$(cd "$root" && pwd -P)"
+    case "$dir/" in "$root"/*) return 0 ;; esac
+  done <<EOF
+$(parent_folders)
+EOF
+  return 1
+}
+
+# ---------------------------------------------------------------- lock
+
+acquire_lock() {
+  mkdir -p "$STATE_DIR"
+  local lock="$STATE_DIR/run.lock"
+  if mkdir "$lock" 2>/dev/null; then
+    echo $$ > "$lock/pid"; trap 'rm -rf "$STATE_DIR/run.lock"' EXIT; return 0
+  fi
+  local pid; pid="$(cat "$lock/pid" 2>/dev/null)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  rm -rf "$lock"; acquire_lock
+}
+
+# ---------------------------------------------------------------- archive
+
+# archive_sizes ARCH -> "folder bytes" per dated folder, sorted oldest first
+archive_sizes() {
+  local arch="$1"
+  {
+    rclone lsf --dirs-only "$arch" 2>/dev/null | sed 's:/$::' | while IFS= read -r d; do echo "$d 0"; done
+    rclone lsf -R --files-only --format "ps" --separator "|" "$arch" 2>/dev/null \
+      | awk -F'|' '{ split($1, p, "/"); s[p[1]] += $2 } END { for (k in s) print k, s[k] }'
+  } | awk '{ s[$1] += $2 } END { for (k in s) print k, s[k] }' | sort
+}
+
+stamp_to_epoch() { date -j -f "%Y-%m-%d_%H%M%S" "$1" +%s 2>/dev/null || echo ""; }
+
+purge_archive_dir() {
+  local path="$1" dry="$2"
+  if [ "$dry" = 1 ]; then echo "  [dry-run] would purge $path"; return; fi
+  rclone purge --drive-use-trash=false "$path" >> "$LOG_FILE" 2>&1 && log "  purged $path"
+}
+
+# prune_archive DIR ARCH NEW_STAMP DRY
+prune_archive() {
+  local dir="$1" arch="$2" new="$3" dry="$4"
+  local days max overflow cutoff list name size ep total new_size
+  days="$(parse_days "$(setting "$dir" ARCHIVE_RETENTION "$D_ARCHIVE_RETENTION")")"
+  max="$(parse_size "$(setting "$dir" ARCHIVE_MAX_SIZE "$D_ARCHIVE_MAX_SIZE")")"
+  overflow="$(setting "$dir" ARCHIVE_OVERFLOW "$D_ARCHIVE_OVERFLOW")"
+  case "$overflow" in keep_one|skip) ;; *) warn "invalid ARCHIVE_OVERFLOW '$overflow', using keep_one"; overflow=keep_one ;; esac
+  cutoff=$(( $(now) - days * 86400 ))
+
+  list="$(archive_sizes "$arch")"
+  [ -z "$list" ] && return 0
+
+  # 1. retention by age (never touches the run that just happened)
+  while read -r name size; do
+    [ -z "$name" ] && continue
+    [ "$name" = "$new" ] && continue
+    ep="$(stamp_to_epoch "$name")"
+    [ -z "$ep" ] && continue   # not one of ours, leave it alone
+    if [ "$ep" -lt "$cutoff" ]; then
+      log "  retention: $name older than ${days}d"
+      purge_archive_dir "$arch/$name" "$dry"
+    fi
+  done <<EOF
+$list
+EOF
+  [ "$max" -eq 0 ] && return 0
+
+  list="$(archive_sizes "$arch" | while read -r n s; do
+    ep="$(stamp_to_epoch "$n")"; [ -n "$ep" ] && [ "$ep" -ge "$cutoff" -o "$n" = "$new" ] && echo "$n $s"; done)"
+  new_size="$(echo "$list" | awk -v n="$new" '$1==n { print $2 }')"
+  new_size="${new_size:-0}"
+
+  # 2. this single run is bigger than the whole archive budget
+  if [ -n "$new" ] && [ "$new_size" -gt "$max" ]; then
+    if [ "$overflow" = "skip" ]; then
+      log "  overflow(skip): run $new is $(human "$new_size") > limit, dropping its history"
+      purge_archive_dir "$arch/$new" "$dry"
+    else
+      log "  overflow(keep_one): run $new is $(human "$new_size") > limit, keeping only it"
+      echo "$list" | while read -r n s; do
+        [ -n "$n" ] && [ "$n" != "$new" ] && purge_archive_dir "$arch/$n" "$dry"
+      done
+    fi
+    return 0
+  fi
+
+  # 3. over budget -> drop oldest first, never the newest run
+  total="$(echo "$list" | awk '{ t += $2 } END { print t+0 }')"
+  echo "$list" | while read -r n s; do
+    [ -z "$n" ] && continue
+    [ "$total" -le "$max" ] && break
+    [ "$n" = "$new" ] && continue
+    log "  size limit: dropping oldest $n ($(human "$s"))"
+    purge_archive_dir "$arch/$n" "$dry"
+    total=$((total - s))
+  done
+}
+
+# ---------------------------------------------------------------- sync
+
+sync_one() {
+  local dir="$1" force="$2" dry="$3"
+  local cfg="$dir/.dfd_bkp" dest arch freq last due stamp filter days rc args
+  [ -f "$cfg" ] || { warn "no .dfd_bkp in $dir"; return 1; }
+
+  if ! is_enabled "$dir"; then
+    echo "skip  $dir (paused)"; return 0
+  fi
+
+  freq="$(parse_frequency "$(setting "$dir" FREQUENCY "$D_FREQUENCY")")"
+  last="$(get_last "$dir")"
+  due=$((last + freq - DUE_SLACK))
+  if [ "$force" != 1 ] && [ "$(now)" -lt "$due" ]; then
+    echo "wait  $dir (next $(fmt_ts $((last + freq))))"; return 0
+  fi
+
+  dest="$(destination "$dir")"
+  arch="$(archive_destination "$dir")"
+  days="$(parse_days "$(setting "$dir" ARCHIVE_RETENTION "$D_ARCHIVE_RETENTION")")"
+  stamp="$(date +%Y-%m-%d_%H%M%S)"
+  filter="$(mktemp)"; write_filter "$dir" "$filter"
+
+  args=(sync "$dir" "$dest" --filter-from "$filter" --log-file "$LOG_FILE" --log-level INFO --stats-one-line --stats 0)
+  case "$dest" in *:*) args+=(--fast-list) ;; esac
+  [ "$days" -gt 0 ] && args+=(--backup-dir "$arch/$stamp")
+  [ "$dry" = 1 ] && args+=(--dry-run)
+
+  echo "sync  $dir -> $dest"
+  if [ "$dry" = 1 ]; then log "START $dir -> $dest (dry-run)"; else log "START $dir -> $dest"; fi
+  rclone "${args[@]}"; rc=$?
+  rm -f "$filter"
+
+  if [ $rc -ne 0 ]; then
+    log "FAIL  $dir (rclone exit $rc)"
+    [ "$dry" = 1 ] || echo "fail $(now) rclone exit $rc" > "$(status_file "$dir")"
+    echo "fail  $dir (rclone exit $rc, see $LOG_FILE)"
+    return $rc
+  fi
+
+  if [ "$days" -gt 0 ]; then prune_archive "$dir" "$arch" "$stamp" "$dry"; fi
+
+  if [ "$dry" != 1 ]; then
+    mkdir -p "$STATE_DIR"
+    now > "$(last_file "$dir")"
+    echo "ok $(now)" > "$(status_file "$dir")"
+  fi
+  nd="$(nested_backups "$dir" | grep $'\tduplicated$' | cut -f1 | tr '\n' ' ')"
+  [ -n "$nd" ] && log "WARN  $dir also uploads nested backups: $nd(run /dfd-bkp to merge or exclude them)"
+  log "DONE  $dir"
+  echo "done  $dir"
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_run() {
+  local force=0 dry=0 target="" dirs d rc=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1 ;;
+      --dry-run) dry=1 ;;
+      -*) die "unknown option $1" ;;
+      *) target="$1" ;;
+    esac
+    shift
+  done
+  command -v rclone >/dev/null || die "rclone not found"
+  acquire_lock || { echo "another dfd-bkp run is in progress"; exit 0; }
+  if [ -n "$target" ]; then dirs="$(abs_dir "$target")"; else
+    [ -f "$GLOBAL_CONFIG" ] || die "missing $GLOBAL_CONFIG (run /dfd-bkp to set up)"
+    dirs="$(find_configs)"
+  fi
+  [ -z "$dirs" ] && echo "no folders with .dfd_bkp found"
+  if [ -n "$dirs" ]; then
+    while IFS= read -r d; do
+      sync_one "$d" "$force" "$dry" || rc=1
+    done <<EOF
+$dirs
+EOF
+  fi
+  # Full scans (what cron runs) stamp the global file so you can see the cron is alive.
+  if [ -z "$target" ] && [ "$dry" != 1 ]; then
+    set_key "$GLOBAL_CONFIG" LAST_CRON_RUN "$(date '+%Y-%m-%d %H:%M:%S')"
+    set_key "$GLOBAL_CONFIG" LAST_CRON_RESULT "$( [ $rc -eq 0 ] && echo ok || echo fail)"
+  fi
+  return $rc
+}
+
+cmd_list() {
+  local d freq last
+  [ -f "$GLOBAL_CONFIG" ] || die "missing $GLOBAL_CONFIG"
+  echo "last cron run: $(read_key "$GLOBAL_CONFIG" LAST_CRON_RUN) ($(read_key "$GLOBAL_CONFIG" LAST_CRON_RESULT))"
+  find_configs | while IFS= read -r d; do
+    freq="$(setting "$d" FREQUENCY "$D_FREQUENCY")"
+    last="$(get_last "$d")"
+    if is_enabled "$d"; then st="active"; else st="paused"; fi
+    printf "%-7s %-5s last=%-16s next=%-16s %s\n" "$st" "$freq" "$(fmt_ts "$last")" \
+      "$( [ "$last" = 0 ] && echo 'next cron' || fmt_ts $((last + $(parse_frequency "$freq"))))" "$d"
+  done
+}
+
+drive_link() {
+  local dest="$1" remote path parent name id
+  remote="${dest%%:*}"; path="${dest#*:}"; path="${path%/}"
+  [ "$remote" = "$dest" ] && return 1     # local path, no link
+  case "$path" in */*) parent="$remote:${path%/*}"; name="${path##*/}" ;; *) parent="$remote:"; name="$path" ;; esac
+  id="$(rclone lsjson --dirs-only --no-modtime --no-mimetype "$parent" 2>/dev/null \
+        | jq -r --arg n "$name" '.[] | select(.Name == $n) | .ID' 2>/dev/null | head -1)"
+  [ -n "$id" ] && [ "$id" != "null" ] && echo "https://drive.google.com/drive/folders/$id"
+}
+
+excluded_dirs() {
+  # Top-most folders (up to 4 levels deep) that the EXCLUDE patterns remove.
+  local dir="$1" filter all kept
+  filter="$(mktemp)"; write_filter "$dir" "$filter"
+  all="$(mktemp)"; kept="$(mktemp)"
+  rclone lsf -R --dirs-only --max-depth 4 "$dir" 2>/dev/null | sort > "$all"
+  rclone lsf -R --dirs-only --max-depth 4 --filter-from "$filter" "$dir" 2>/dev/null | sort > "$kept"
+  comm -23 "$all" "$kept" | awk '
+    { for (i in top) if (index($0, i) == 1) next; top[$0]=1; print }'
+  rm -f "$filter" "$all" "$kept"
+}
+
+# nested_backups DIR -> "relpath<TAB>duplicated|excluded" for every folder below
+# DIR with its own .dfd_bkp. duplicated = DIR's backup also uploads it.
+nested_backups() {
+  local dir="$1" prune_expr="" d rel filter kept
+  for d in $PRUNE_DIRS; do prune_expr="$prune_expr -name $d -o"; done
+  prune_expr="${prune_expr% -o}"
+  # shellcheck disable=SC2086
+  rels="$(find "$dir" -mindepth 2 \( $prune_expr \) -prune -o -name .dfd_bkp -type f -print 2>/dev/null \
+          | sed "s|^$dir/||; s|/.dfd_bkp$||" | sort)"
+  [ -z "$rels" ] && return 0
+  filter="$(mktemp)"; kept="$(mktemp)"
+  write_filter "$dir" "$filter"
+  echo "$rels" | while IFS= read -r rel; do echo "+ /$rel/.dfd_bkp" >> "$filter"; done
+  echo "- **" >> "$filter"
+  rclone lsf -R --files-only --filter-from "$filter" "$dir" 2>/dev/null | sed 's|/.dfd_bkp$||' | sort > "$kept"
+  echo "$rels" | while IFS= read -r rel; do
+    if grep -qxF "$rel" "$kept"; then printf "%s\tduplicated\n" "$rel"; else printf "%s\texcluded\n" "$rel"; fi
+  done
+  rm -f "$filter" "$kept"
+}
+
+# symlinks DIR -> symlinks inside the backup (after EXCLUDE) that rclone skips
+symlinks_skipped() {
+  local dir="$1" filter
+  filter="$(mktemp)"; write_filter "$dir" "$filter"
+  rclone lsf -R --files-only --links --filter-from "$filter" "$dir" 2>/dev/null | grep '\.rclonelink$' | sed 's/\.rclonelink$//'
+  rm -f "$filter"
+}
+
+cmd_status() {
+  local dir dest arch last freq st link ex archsize nested
+  dir="$(abs_dir "${1:-.}")"
+  if [ ! -f "$dir/.dfd_bkp" ]; then
+    nested="$(nested_backups "$dir")"
+    echo "configured=no"
+    echo "folder=$dir"
+    covered_by_parent "$dir" && echo "covered_by_parent=yes" || echo "covered_by_parent=no"
+    echo "nested_backups=$(echo "$nested" | grep -c .)"
+    echo "global_config=$( [ -f "$GLOBAL_CONFIG" ] && echo yes || echo no)"
+    return 0
+  fi
+  nested="$(nested_backups "$dir")"
+  dest="$(destination "$dir")"; arch="$(archive_destination "$dir")"
+  last="$(get_last "$dir")"; freq="$(setting "$dir" FREQUENCY "$D_FREQUENCY")"
+  if is_enabled "$dir"; then st=active; else st=paused; fi
+  link="$(drive_link "$dest")"
+  ex="$(excluded_dirs "$dir")"
+  archsize="$(archive_sizes "$arch" | awk '{ t += $2; n++ } END { print t+0, n+0 }')"
+  echo "configured=yes"
+  echo "folder=$dir"
+  echo "state=$st"
+  echo "destination=$dest"
+  echo "drive_link=${link:-unknown (not synced yet?)}"
+  echo "frequency=$freq"
+  echo "last_run=$(fmt_ts "$last")"
+  echo "next_run=$( [ "$last" = 0 ] && echo 'next cron tick' || fmt_ts $((last + $(parse_frequency "$freq"))))"
+  echo "last_result=$(cat "$(status_file "$dir")" 2>/dev/null | awk '{ print $1 }')"
+  echo "exclude_patterns=$(read_all "$dir/.dfd_bkp" EXCLUDE | wc -l | tr -d ' ')"
+  echo "excluded_folders=$(echo "$ex" | grep -c . )"
+  echo "archive_destination=$arch"
+  echo "archive_retention=$(setting "$dir" ARCHIVE_RETENTION "$D_ARCHIVE_RETENTION")"
+  echo "archive_max_size=$(setting "$dir" ARCHIVE_MAX_SIZE "$D_ARCHIVE_MAX_SIZE")"
+  echo "archive_overflow=$(setting "$dir" ARCHIVE_OVERFLOW "$D_ARCHIVE_OVERFLOW")"
+  echo "archive_used=$(human "${archsize% *}") in ${archsize#* } versions"
+  covered_by_parent "$dir" && echo "covered_by_parent=yes" || echo "covered_by_parent=no"
+  echo "nested_backups=$(echo "$nested" | grep -c .)"
+  echo "nested_duplicated=$(echo "$nested" | grep -c $'\tduplicated$')"
+  echo "last_cron_run=$(read_key "$GLOBAL_CONFIG" LAST_CRON_RUN) ($(read_key "$GLOBAL_CONFIG" LAST_CRON_RESULT))"
+}
+
+cmd_excluded() { excluded_dirs "$(abs_dir "${1:-.}")"; }
+cmd_nested() { nested_backups "$(abs_dir "${1:-.}")"; }
+
+cmd_preview() {
+  local dir filter links nested
+  dir="$(abs_dir "${1:-.}")"
+  filter="$(mktemp)"; write_filter "$dir" "$filter"
+  echo "Would upload (after EXCLUDE):"
+  rclone size --filter-from "$filter" "$dir" 2>/dev/null
+  rm -f "$filter"
+  links="$(symlinks_skipped "$dir")"
+  if [ -n "$links" ]; then
+    echo ""
+    echo "Symlinks NOT backed up (only real files are copied):"
+    echo "$links" | sed 's/^/  /'
+  fi
+  nested="$(nested_backups "$dir" | grep $'\tduplicated$' | cut -f1)"
+  if [ -n "$nested" ]; then
+    echo ""
+    echo "Folders inside with their own .dfd_bkp (uploaded twice):"
+    echo "$nested" | sed 's/^/  /'
+  fi
+}
+
+# exclude DIR PATTERN -> append EXCLUDE=PATTERN (no duplicates)
+cmd_exclude() {
+  local dir pat
+  [ $# -eq 2 ] || die "usage: dfd-bkp exclude DIR PATTERN"
+  dir="$(abs_dir "$1")"; pat="$2"
+  [ -f "$dir/.dfd_bkp" ] || die "no .dfd_bkp in $dir"
+  if read_all "$dir/.dfd_bkp" EXCLUDE | grep -qxF "$pat"; then echo "already excluded: $pat"; return 0; fi
+  echo "EXCLUDE=$pat" >> "$dir/.dfd_bkp"
+  echo "EXCLUDE=$pat"
+}
+
+# remove DIR [--delete-remote] -> stop backing up DIR
+cmd_remove() {
+  local dir="" del=0 dest arch
+  while [ $# -gt 0 ]; do
+    case "$1" in --delete-remote) del=1 ;; -*) die "unknown option $1" ;; *) dir="$1" ;; esac
+    shift
+  done
+  dir="$(abs_dir "${dir:-.}")"
+  [ -f "$dir/.dfd_bkp" ] || die "no .dfd_bkp in $dir"
+  dest="$(destination "$dir")"; arch="$(archive_destination "$dir")"
+  if [ "$del" = 1 ]; then
+    rclone purge --drive-use-trash=true "$dest" 2>/dev/null && echo "deleted remote copy $dest (in Drive trash for 30 days)"
+    rclone purge --drive-use-trash=true "$arch" 2>/dev/null && echo "deleted remote history $arch (in Drive trash for 30 days)"
+    log "REMOVE $dir (remote deleted)"
+  else
+    log "REMOVE $dir (remote kept at $dest)"
+    echo "remote copy kept at $dest"
+  fi
+  rm -f "$dir/.dfd_bkp" "$(last_file "$dir")" "$(status_file "$dir")"
+  echo "removed $dir/.dfd_bkp"
+}
+
+# update -> re-download the skill files (SKILL.md + this script)
+REPO_RAW="https://raw.githubusercontent.com/42pe/dfd_sync/main/skill/dfd-bkp"
+fetch() { # fetch REPO_PATH OUT
+  curl -fsSL "$REPO_RAW/$1" -o "$2" 2>/dev/null && return 0
+  command -v gh >/dev/null && gh api -H "Accept: application/vnd.github.raw" \
+    "repos/42pe/dfd_sync/contents/skill/dfd-bkp/$1" > "$2" 2>/dev/null && return 0
+  return 1
+}
+cmd_update() {
+  local skill_dir tmp newv real
+  skill_dir="$(cd "$(dirname "$SELF")/.." && pwd)"
+  real="$(cd "$skill_dir" && pwd -P)"
+  if git -C "$real" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "this skill is a git checkout ($real); update it with: git -C \"$real\" pull"; return 0
+  fi
+  tmp="$(mktemp -d)"
+  fetch "scripts/dfd-bkp" "$tmp/dfd-bkp" && fetch "SKILL.md" "$tmp/SKILL.md" || { rm -rf "$tmp"; die "download failed"; }
+  bash -n "$tmp/dfd-bkp" || { rm -rf "$tmp"; die "downloaded script is broken, not installed"; }
+  newv="$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$tmp/dfd-bkp" | head -1)"
+  if [ "$newv" = "$VERSION" ]; then echo "already up to date ($VERSION)"; rm -rf "$tmp"; return 0; fi
+  cp "$tmp/SKILL.md" "$skill_dir/SKILL.md"
+  cp "$tmp/dfd-bkp" "$skill_dir/scripts/dfd-bkp"; chmod +x "$skill_dir/scripts/dfd-bkp"
+  rm -rf "$tmp"
+  echo "updated $VERSION -> $newv"
+}
+
+cmd_init() {
+  local dir freq="$D_FREQUENCY" name excludes="" cfg
+  dir="."
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --frequency) freq="$2"; shift ;;
+      --exclude) excludes="$excludes$2"$'\n'; shift ;;
+      -*) die "unknown option $1" ;;
+      *) dir="$1" ;;
+    esac
+    shift
+  done
+  dir="$(abs_dir "$dir")"; cfg="$dir/.dfd_bkp"; name="$(folder_name "$dir")"
+  [ -f "$cfg" ] && die "$cfg already exists"
+  validate_frequency "$freq"
+  {
+    echo "# dfd-bkp folder config — read by dfd-bkp on every cron tick."
+    echo "# Docs: run /dfd-bkp in a Claude session inside this folder."
+    echo ""
+    echo "# false pauses this backup without deleting anything."
+    echo "ENABLED=true"
+    echo ""
+    echo "# rclone destination (remote:path)."
+    echo "DESTINATION=$D_REMOTE:$D_BASE/$name"
+    echo ""
+    echo "# How often to sync: Nh or Nd. Minimum 1h. Cron checks every hour."
+    echo "FREQUENCY=$freq"
+    echo ""
+    echo "# History: changed/deleted files are moved to a dated folder here."
+    echo "ARCHIVE_DESTINATION=$D_REMOTE:$D_BASE/_archive/$name"
+    echo ""
+    echo "# Uncomment to override the defaults in ~/.dfd_bkp_sync."
+    echo "# ARCHIVE_RETENTION=$D_ARCHIVE_RETENTION      # Nd, 0d = keep no history"
+    echo "# ARCHIVE_MAX_SIZE=$D_ARCHIVE_MAX_SIZE    # GB, up to 2 decimals; none = no limit"
+    echo "# ARCHIVE_OVERFLOW=$D_ARCHIVE_OVERFLOW  # keep_one | skip (one run bigger than the limit)"
+    echo ""
+    echo "# rclone filter patterns, one per line. Leading / = relative to this folder."
+    # .DS_Store is always excluded; drop duplicates, keep order
+    printf "%s.DS_Store\n" "$excludes" | sed '/^$/d' | awk '!seen[$0]++' | sed 's/^/EXCLUDE=/'
+  } > "$cfg"
+  echo "created $cfg"
+}
+
+cmd_global_init() {
+  local f
+  [ -f "$GLOBAL_CONFIG" ] && die "$GLOBAL_CONFIG already exists"
+  [ $# -gt 0 ] || die "usage: dfd-bkp global-init FOLDER [FOLDER...]"
+  {
+    echo "# dfd-bkp global config."
+    echo "# FOLDER = parent folders scanned for .dfd_bkp files (one per line, ~ allowed)."
+    echo "# Avoid ~/Library, ~/Documents, ~/Desktop, ~/Downloads: macOS blocks cron there."
+    for f in "$@"; do echo "FOLDER=$f"; done
+    echo ""
+    echo "# Defaults for every folder; any .dfd_bkp can override them."
+    echo "ARCHIVE_RETENTION=$D_ARCHIVE_RETENTION"
+    echo "ARCHIVE_MAX_SIZE=$D_ARCHIVE_MAX_SIZE"
+    echo "ARCHIVE_OVERFLOW=$D_ARCHIVE_OVERFLOW"
+    echo ""
+    echo "# Written by every cron run (full scan). Don't edit."
+    echo "LAST_CRON_RUN=never"
+    echo "LAST_CRON_RESULT="
+  } > "$GLOBAL_CONFIG"
+  echo "created $GLOBAL_CONFIG"
+}
+
+cmd_add_folder() {
+  [ -f "$GLOBAL_CONFIG" ] || die "missing $GLOBAL_CONFIG"
+  local f="$1"
+  read_all "$GLOBAL_CONFIG" FOLDER | grep -qxF "$f" && { echo "already listed: $f"; return 0; }
+  tmp="$(mktemp)"
+  awk -v line="FOLDER=$f" '
+    !done && /^[[:space:]]*FOLDER[[:space:]]*=/ { last=NR }
+    { lines[NR]=$0 }
+    END { for (i=1;i<=NR;i++) { print lines[i]; if (i==last) print line }; if (!last) print line }' "$GLOBAL_CONFIG" > "$tmp"
+  cat "$tmp" > "$GLOBAL_CONFIG"; rm -f "$tmp"
+  echo "added FOLDER=$f"
+}
+
+cmd_set() {
+  local dir key value
+  [ $# -eq 3 ] || die "usage: dfd-bkp set DIR KEY VALUE"
+  dir="$(abs_dir "$1")"; key="$2"; value="$3"
+  [ -f "$dir/.dfd_bkp" ] || die "no .dfd_bkp in $dir"
+  case "$key" in
+    FREQUENCY) validate_frequency "$value" ;;
+    ARCHIVE_OVERFLOW) case "$value" in keep_one|skip) ;; *) die "ARCHIVE_OVERFLOW must be keep_one or skip" ;; esac ;;
+    ARCHIVE_MAX_SIZE) [ "$value" = none ] || echo "$value" | grep -qE '^[0-9]+(\.[0-9]{1,2})?GB$' || die "ARCHIVE_MAX_SIZE must look like 1.00GB or none" ;;
+    ARCHIVE_RETENTION) echo "$value" | grep -qE '^[0-9]+d$' || die "ARCHIVE_RETENTION must look like 90d" ;;
+  esac
+  set_key "$dir/.dfd_bkp" "$key" "$value"
+  echo "$key=$value"
+}
+
+cmd_pause()  { cmd_set "${1:-.}" ENABLED false; }
+cmd_resume() { cmd_set "${1:-.}" ENABLED true; }
+
+# set-next DIR HH:MM -> make the next run land at HH:MM by rewriting last-run
+cmd_set_next() {
+  local dir hhmm freq target last
+  [ $# -eq 2 ] || die "usage: dfd-bkp set-next DIR HH:MM"
+  dir="$(abs_dir "$1")"; hhmm="$2"
+  echo "$hhmm" | grep -qE '^([01][0-9]|2[0-3]):[0-5][0-9]$' || die "time must be HH:MM (24h)"
+  freq="$(parse_frequency "$(setting "$dir" FREQUENCY "$D_FREQUENCY")")"
+  target="$(date -j -f "%Y-%m-%d %H:%M:%S" "$(date +%Y-%m-%d) $hhmm:00" +%s)"
+  [ "$target" -le "$(now)" ] && target=$((target + 86400))
+  last=$((target - freq))
+  mkdir -p "$STATE_DIR"; echo "$last" > "$(last_file "$dir")"
+  echo "next run: $(fmt_ts "$target") (cron fires on the hour; runs at the first tick at or after this time)"
+}
+
+cmd_install_cron() {
+  local line="0 * * * * \"$SELF\" run >> \"$LOG_DIR/cron.log\" 2>&1 $CRON_MARKER"
+  mkdir -p "$LOG_DIR"
+  if crontab -l 2>/dev/null | grep -qF "$CRON_MARKER"; then
+    (crontab -l 2>/dev/null | grep -vF "$CRON_MARKER"; echo "$line") | crontab - && echo "cron entry updated"
+  else
+    (crontab -l 2>/dev/null; echo "$line") | crontab - && echo "cron entry installed"
+  fi
+  crontab -l | grep -F "$CRON_MARKER"
+}
+
+cmd_uninstall_cron() {
+  crontab -l 2>/dev/null | grep -vF "$CRON_MARKER" | crontab - && echo "cron entry removed"
+}
+
+cmd_doctor() {
+  local ok=0 remote="${1:-$D_REMOTE}" root
+  check() { if eval "$2" >/dev/null 2>&1; then echo "ok    $1"; else echo "FAIL  $1${3:+ — $3}"; ok=1; fi; }
+  check "rclone installed" "command -v rclone" "brew install rclone"
+  check "jq installed" "command -v jq" "brew install jq"
+  check "rclone remote '$remote' exists" "rclone listremotes | grep -qx '$remote:'" "run: rclone config create $remote drive scope=drive (opens the browser to sign in)"
+  if rclone listremotes 2>/dev/null | grep -qx "$remote:"; then
+    check "remote '$remote' is reachable" "rclone lsd '$remote:' --max-depth 1" "token revoked or expired? run: rclone config reconnect $remote:"
+  else
+    echo "skip  remote '$remote' is reachable (create the remote first)"
+  fi
+  check "global config $GLOBAL_CONFIG" "test -f '$GLOBAL_CONFIG'"
+  check "cron entry installed" "crontab -l | grep -qF '$CRON_MARKER'" "run: dfd-bkp install-cron"
+  check "state dir writable" "mkdir -p '$STATE_DIR' && test -w '$STATE_DIR'"
+  if [ -f "$GLOBAL_CONFIG" ]; then
+    while IFS= read -r root; do
+      [ -z "$root" ] && continue
+      check "parent folder exists: $root" "test -d '$root'"
+      case "$root" in
+        "$HOME"|"$HOME/Library"*|"$HOME/Documents"*|"$HOME/Desktop"*|"$HOME/Downloads"*)
+          echo "WARN  $root is protected by macOS; cron needs Full Disk Access (System Settings > Privacy & Security > Full Disk Access > add /usr/sbin/cron)" ;;
+      esac
+    done <<EOF
+$(parent_folders)
+EOF
+  fi
+  return $ok
+}
+
+usage() {
+  cat <<EOF
+dfd-bkp $VERSION — one-way folder backups with rclone
+
+  run [--force] [--dry-run] [DIR]   sync every due folder (or only DIR)
+  list                              all folders with .dfd_bkp and their schedule
+  status [DIR]                      key=value status for one folder
+  preview [DIR]                     size that would be uploaded
+  excluded [DIR]                    folders removed by EXCLUDE patterns
+  nested [DIR]                      folders inside with their own .dfd_bkp
+  exclude DIR PATTERN               add an EXCLUDE line
+  remove [DIR] [--delete-remote]    stop backing up DIR (optionally delete it in Drive)
+  update                            re-download the skill (not for git checkouts)
+  init [DIR] [--frequency 12h] [--exclude PATTERN]...
+                                    create a .dfd_bkp
+  global-init FOLDER...             create ~/.dfd_bkp_sync
+  add-folder FOLDER                 add a parent folder to ~/.dfd_bkp_sync
+  set DIR KEY VALUE                 change a key in DIR/.dfd_bkp
+  pause [DIR] | resume [DIR]        toggle ENABLED
+  set-next DIR HH:MM                make the next run happen at HH:MM
+  install-cron | uninstall-cron     hourly crontab entry
+  doctor [REMOTE]                   check rclone, remote, cron, folders
+EOF
+}
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  run) cmd_run "$@" ;;
+  list) cmd_list ;;
+  status) cmd_status "$@" ;;
+  preview) cmd_preview "$@" ;;
+  excluded) cmd_excluded "$@" ;;
+  nested) cmd_nested "$@" ;;
+  exclude) cmd_exclude "$@" ;;
+  remove) cmd_remove "$@" ;;
+  update) cmd_update ;;
+  init) cmd_init "$@" ;;
+  global-init) cmd_global_init "$@" ;;
+  add-folder) cmd_add_folder "$@" ;;
+  set) cmd_set "$@" ;;
+  pause) cmd_pause "$@" ;;
+  resume) cmd_resume "$@" ;;
+  set-next) cmd_set_next "$@" ;;
+  install-cron) cmd_install_cron ;;
+  uninstall-cron) cmd_uninstall_cron ;;
+  doctor) cmd_doctor "$@" ;;
+  version|--version) echo "$VERSION" ;;
+  ""|help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac
