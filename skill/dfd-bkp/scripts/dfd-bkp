@@ -12,7 +12,7 @@ set -u
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 GLOBAL_CONFIG="${DFD_BKP_CONFIG:-$HOME/.dfd_bkp_sync}"
 STATE_DIR="${DFD_BKP_STATE:-$HOME/.local/state/dfd-bkp}"
 LOG_DIR="${DFD_BKP_LOGS:-$HOME/Library/Logs/dfd-bkp}"
