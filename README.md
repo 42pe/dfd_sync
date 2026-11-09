@@ -121,6 +121,10 @@ skill/dfd-bkp/
 └── scripts/dfd-bkp     script bash: run, list, status, preview, nested, update, doctor…
 ```
 
+## 👋 Créditos
+
+Creado por **[diegoferreyra.com](https://diegoferreyra.com)**. Sígueme en Instagram en **[@diegoferreyra.com_](https://instagram.com/diegoferreyra.com_)** para más consejos, talleres y servicios de desarrollo y procesos.
+
 ---
 
 ## 🤖 Instrucciones para el agente
