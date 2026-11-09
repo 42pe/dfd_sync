@@ -97,7 +97,7 @@ them for you.
 old one moves to `Backups/_archive/<folder>/<date-time>/`. If you break
 something, the previous version is there.
 
-## Mac only, for now
+## Made for Mac, but on Windows you can adapt it
 
 It works on macOS today. The ideas are simple, though: a copy program, a
 scheduler, a settings file per folder. On Windows the scheduler is *Task
